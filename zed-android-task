@@ -19,8 +19,62 @@
 #   `android studio render-compose-preview`, tile the resulting images into
 #   one PNG, and open it in Zed. Requires Android Studio (Quail 1 or newer)
 #   running with the project open. See `zed-android-task preview --help`.
+#
+# Windows: run under Git Bash (MSYS2). zed-android-task.cmd forwards from
+#   PowerShell, cmd.exe and Zed tasks; see README.md for details.
 
 set -euo pipefail
+
+# --- Platform ---
+
+# True on Git Bash / MSYS2 / Cygwin.
+is_windows() {
+    case "$(uname -s 2>/dev/null)" in
+        MINGW*|MSYS*|CYGWIN*) return 0 ;;
+    esac
+    return 1
+}
+
+# Populate PYTHON with a working Python 3 command (array, may be `py -3`).
+# Windows installs frequently expose only `python` or the `py` launcher.
+PYTHON=()
+detect_python() {
+    local cand
+    for cand in python3 python; do
+        if command -v "$cand" >/dev/null 2>&1 &&
+            "$cand" -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
+            PYTHON=("$cand")
+            return 0
+        fi
+    done
+    if command -v py >/dev/null 2>&1 &&
+        py -3 -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
+        PYTHON=(py -3)
+        return 0
+    fi
+    return 1
+}
+
+# Populate GRADLEW with the command used to invoke Gradle from the repo root.
+GRADLEW=()
+detect_gradlew() {
+    if is_windows && [[ -f ./gradlew.bat ]]; then
+        # gradlew.bat is the canonical Windows entry point; `//c` survives
+        # MSYS path mangling better than `/c`.
+        GRADLEW=(cmd //c gradlew.bat)
+    elif [[ -x ./gradlew ]]; then
+        GRADLEW=(./gradlew)
+    elif [[ -f ./gradlew ]]; then
+        # Git Bash checkouts often lose the executable bit.
+        GRADLEW=(bash ./gradlew)
+    elif [[ -f ./gradlew.bat ]]; then
+        GRADLEW=(cmd //c gradlew.bat)
+    else
+        echo "Error: no gradlew or gradlew.bat in $(pwd)" >&2
+        echo "  Run zed-android-task from the Android project root." >&2
+        return 1
+    fi
+}
 
 # --- Helpers ---
 
@@ -29,12 +83,13 @@ set -euo pipefail
 extract_val() {
     local f="$1" key="$2"
     # Handles: key = "val", key "val", key="val", key='val'
-    sed -n 's/^[[:space:]]*'"$key"'[[:space:]=]*"\([^"]*\)".*/\1/p' "$f" | head -1
+    # tr strips CR so CRLF checkouts (Windows) parse identically.
+    sed -n 's/^[[:space:]]*'"$key"'[[:space:]=]*"\([^"]*\)".*/\1/p' "$f" | tr -d '\r' | head -1
 }
 
 extract_val_single_quote() {
     local f="$1" key="$2"
-    sed -n "s/^[[:space:]]*${key}[[:space:]=]*'\([^']*\)'.*/\1/p" "$f" | head -1
+    sed -n "s/^[[:space:]]*${key}[[:space:]=]*'\([^']*\)'.*/\1/p" "$f" | tr -d '\r' | head -1
 }
 
 # Extract applicationIdSuffix from a named block inside productFlavors or buildTypes.
@@ -86,7 +141,7 @@ extract_suffix() {
             if (result != "") exit
         }
     }
-    END { if (result != "") print result }' "$f" 2>/dev/null
+    END { if (result != "") print result }' "$f" 2>/dev/null | tr -d '\r'
 }
 
 # --- Variant parsing ---
@@ -169,7 +224,7 @@ detect_base_package() {
 
     # Fallback: legacy projects without applicationId in build.gradle
     if [[ -f "$manifest" ]]; then
-        pkg=$(sed -n 's/.*package="\([^"]*\)".*/\1/p' "$manifest" | head -1)
+        pkg=$(sed -n 's/.*package="\([^"]*\)".*/\1/p' "$manifest" | tr -d '\r' | head -1)
         if [[ -n "$pkg" ]]; then
             echo "$pkg"
             return 0
@@ -246,7 +301,7 @@ EOF
 # (e.g. @PreviewLightDark / @MyScreenPreview), annotations that span several
 # lines, and comments/strings that would otherwise produce false positives.
 discover_previews() {
-    python3 - "$1" <<'PY'
+    run_python - "$1" <<'PY'
 import re
 import sys
 
@@ -356,27 +411,39 @@ print("\n".join(names))
 PY
 }
 
+# Run the interpreter found by detect_python.
+run_python() {
+    "${PYTHON[@]}" "$@"
+}
+
 # Echo the path to a python interpreter that can `import PIL`. Installs
 # Pillow into a cached virtualenv on first use so the caller never has to.
 preview_python_with_pillow() {
-    if python3 -c 'import PIL' >/dev/null 2>&1; then
-        printf '%s\n' "python3"
+    if run_python -c 'import PIL' >/dev/null 2>&1; then
+        run_python -c 'import sys; print(sys.executable)'
         return 0
     fi
 
     local venv="${XDG_CACHE_HOME:-$HOME/.cache}/zed-android-task/venv"
-    if [[ -x "$venv/bin/python" ]] && "$venv/bin/python" -c 'import PIL' >/dev/null 2>&1; then
-        printf '%s\n' "$venv/bin/python"
-        return 0
-    fi
+    local py
+    # Windows virtualenvs use Scripts/python.exe; POSIX uses bin/python.
+    for py in "$venv/Scripts/python.exe" "$venv/bin/python"; do
+        if [[ -x "$py" ]] && "$py" -c 'import PIL' >/dev/null 2>&1; then
+            printf '%s\n' "$py"
+            return 0
+        fi
+    done
 
     echo "zed-android-task: installing Pillow into $venv ..." >&2
-    python3 -m venv "$venv" >/dev/null 2>&1 || return 1
-    "$venv/bin/python" -m pip install --quiet --disable-pip-version-check pillow >/dev/null 2>&1 || return 1
-    if "$venv/bin/python" -c 'import PIL' >/dev/null 2>&1; then
-        printf '%s\n' "$venv/bin/python"
-        return 0
-    fi
+    run_python -m venv "$venv" >/dev/null 2>&1 || return 1
+    for py in "$venv/Scripts/python.exe" "$venv/bin/python"; do
+        [[ -x "$py" ]] || continue
+        "$py" -m pip install --quiet --disable-pip-version-check pillow >/dev/null 2>&1 || continue
+        if "$py" -c 'import PIL' >/dev/null 2>&1; then
+            printf '%s\n' "$py"
+            return 0
+        fi
+    done
     return 1
 }
 
@@ -454,8 +521,9 @@ do_preview() {
         echo "  Install it: https://developer.android.com/tools/android-cli" >&2
         return 1
     }
-    command -v python3 >/dev/null 2>&1 || {
-        echo "zed-android-task preview: python3 not found on PATH." >&2
+    detect_python || {
+        echo "zed-android-task preview: no Python 3 found on PATH." >&2
+        echo "  Install Python 3 (or the 'py' launcher on Windows) and retry." >&2
         return 1
     }
 
@@ -488,7 +556,7 @@ do_preview() {
     local py
     if ! py="$(preview_python_with_pillow)"; then
         echo "zed-android-task preview: could not obtain a Python with Pillow." >&2
-        echo "  Install it manually, e.g. 'python3 -m pip install pillow'." >&2
+        echo "  Install it manually, e.g. 'python -m pip install pillow'." >&2
         return 1
     fi
 
@@ -501,8 +569,13 @@ do_preview() {
     done <<< "$names"
     echo
 
-    local tmp
-    tmp="$(mktemp -d "${TMPDIR:-/tmp}/zed-compose-preview.XXXXXX")"
+    local tmp tmpbase="${TMPDIR:-${TMP:-/tmp}}"
+    # Git Bash exposes TMP as a Windows path; normalize so mktemp and the
+    # native python receive a POSIX path (MSYS converts it back on spawn).
+    if command -v cygpath >/dev/null 2>&1; then
+        tmpbase="$(cygpath -u "$tmpbase")"
+    fi
+    tmp="$(mktemp -d "$tmpbase/zed-compose-preview.XXXXXX")"
 
     local rendered=()
     while IFS= read -r nm; do
@@ -659,6 +732,26 @@ PY
 }
 
 
+# Resolve the pidcat entry point. Git Bash does not apply PATHEXT, so a
+# gem-installed pidcat.bat on Windows must be named explicitly.
+pidcat_cmd() {
+    if command -v pidcat >/dev/null 2>&1; then
+        printf '%s\n' pidcat
+    elif command -v pidcat.bat >/dev/null 2>&1; then
+        printf '%s\n' pidcat.bat
+    else
+        echo "zed-android-task: pidcat not found on PATH." >&2
+        echo "  Install it: gem install pidcat" >&2
+        return 1
+    fi
+}
+
+# PID of a running package as a bare number. Windows adb can emit CRLF, and a
+# stray \r would corrupt `--pid=1234\r`.
+pid_of() {
+    adb shell pidof -s "$1" 2>/dev/null | tr -d '\r\n'
+}
+
 # --- Main ---
 
 main() {
@@ -676,11 +769,12 @@ main() {
             # These use variant-based gradle task naming
             local variant="${arg:-debug}"
             parse_variant "$variant"
+            detect_gradlew || return 1
 
             if [[ "$cmd" == "install" ]]; then
-                exec ./gradlew "assemble${VARIANT_TASK_CAP}" "install${VARIANT_TASK_CAP}"
+                exec "${GRADLEW[@]}" "assemble${VARIANT_TASK_CAP}" "install${VARIANT_TASK_CAP}"
             else
-                ./gradlew "assemble${VARIANT_TASK_CAP}" "install${VARIANT_TASK_CAP}"
+                "${GRADLEW[@]}" "assemble${VARIANT_TASK_CAP}" "install${VARIANT_TASK_CAP}"
                 local pkg
                 pkg=$(compute_variant_package)
                 if [[ -z "$pkg" ]]; then
@@ -691,8 +785,10 @@ main() {
             fi
             ;;
         pidcat)
+            local pcat
+            pcat=$(pidcat_cmd) || exit 1
             if [[ -n "$arg" ]]; then
-                exec pidcat "$arg"
+                exec "$pcat" "$arg"
             else
                 parse_variant "debug"
                 local pkg
@@ -701,12 +797,12 @@ main() {
                     echo "Error: could not auto-detect package name. Specify it: zed-android-task pidcat com.example.app" >&2
                     exit 1
                 fi
-                exec pidcat "$pkg"
+                exec "$pcat" "$pkg"
             fi
             ;;
         logcat)
             if [[ -n "$arg" ]]; then
-                exec adb logcat -v color --pid="$(adb shell pidof -s "$arg")" '*:V'
+                exec adb logcat -v color --pid="$(pid_of "$arg")" '*:V'
             else
                 parse_variant "debug"
                 local pkg
@@ -715,7 +811,7 @@ main() {
                     echo "Error: could not auto-detect package name. Specify it: zed-android-task logcat com.example.app" >&2
                     exit 1
                 fi
-                exec adb logcat -v color --pid="$(adb shell pidof -s "$pkg")" '*:V'
+                exec adb logcat -v color --pid="$(pid_of "$pkg")" '*:V'
             fi
             ;;
         tlog)

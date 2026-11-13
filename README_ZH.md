@@ -23,13 +23,29 @@ ln -s ~/Projects/GitHubProjects/zed-android-task/zed-android-task ~/.local/bin/z
 
 | 命令 | 依赖 |
 | --- | --- |
-| `install` / `run` | 项目根目录下的 `gradlew`、`adb` |
+| `install` / `run` | 项目根目录下的 `gradlew` / `gradlew.bat`、`adb` |
 | `pidcat` | [`pidcat`](https://github.com/JakeWharton/pidcat) |
 | `logcat` | `adb` |
 | `tlog` | [`tlog`](https://github.com/ryans233/tlog) |
-| `preview` | `android` CLI（[Android CLI](https://developer.android.com/tools/android-cli)）、`python3`、Pillow、Android Studio（Quail 1 或更新） |
+| `preview` | `android` CLI（[Android CLI](https://developer.android.com/tools/android-cli)）、Python 3、Pillow、Android Studio（Quail 1 或更新） |
 
 所有命令都应在 Android 项目根目录执行（脚本读取 `app/build.gradle[.kts]`、调用 `./gradlew`）。
+
+## Windows
+
+实现只有一份 bash 脚本，没有 PowerShell 版本。Windows 上通过 **Git Bash**（MSYS2）运行，`zed-android-task.cmd` 转发层让它可从 PowerShell、cmd.exe 和 Zed 任务中直接调用。
+
+```powershell
+git clone git@github.com:ryans233/zed-android-task.git C:\src\zed-android-task
+# 把仓库目录加入 PATH 后，在任意 shell 中调用 cmd 转发层：
+C:\src\zed-android-task\zed-android-task.cmd run qaDebug
+```
+
+- `zed-android-task.cmd` 自动定位 `bash.exe`（Program Files / LocalAppData / `where bash`，会跳过 WSL 的 System32 launcher），透传全部参数与退出码；可用 `ZED_ANDROID_TASK_BASH` 指定。
+- Windows 上 Zed 通过 PowerShell 执行任务，因此只要转发层所在目录在 `PATH` 中，`"command": "zed-android-task run qaDebug"` 可直接使用。
+- 在 Git Bash 内 `ln -s` 需要开发者模式或管理员权限；可直接使用 `.cmd`，或把仓库目录加入 `PATH`，无需软链。
+- 脚本已处理的平台差异：优先使用 `gradlew.bat`；`gradlew` 缺少执行位时用 `bash ./gradlew`；Python 按 `python3` → `python` → `py -3` 探测；虚拟环境兼容 `Scripts/python.exe`；CRLF 的 Gradle 文件与 `adb` 输出统一 `tr -d '\r'`。
+- `pidcat` 在 Windows 需要 Ruby（RubyInstaller）；`logcat`、`tlog` 无额外运行时。`preview` 还要求 `android` CLI 在 Windows 可用，缺失时脚本会给出明确报错。
 
 ## 子命令
 
@@ -155,4 +171,5 @@ zed-android-task preview app/src/main/java/.../HomeScreen.kt
 - `run <variant>` 一次性完成构建、安装、启动，适合与 `hide: "on_success"` 配合；
 - `pidcat`/`logcat`/`tlog` 传显式包名可省略探测开销，且在自动探测失败时仍可用；
 - 日志类任务用 `use_new_terminal: true`，避免占用构建终端；
-- `install`/`run`/`pidcat`/`logcat`/`tlog` 内部用 `exec` 替换进程；`install` 之后不会执行同一任务的后续命令，需要“装完即跑”请用 `run`。
+- `install`/`run`/`pidcat`/`logcat`/`tlog` 内部用 `exec` 替换进程；`install` 之后不会执行同一任务的后续命令，需要“装完即跑”请用 `run`；
+- Windows 上把含 `zed-android-task.cmd` 的仓库目录加入 `PATH`，同一份 `tasks.json` 无需修改即可使用（Zed 在 Windows 用 PowerShell 执行任务）。

@@ -23,13 +23,29 @@ Make sure `~/.local/bin` is on `PATH`. Dependencies:
 
 | Command | Requires |
 | --- | --- |
-| `install` / `run` | project-root `gradlew`, `adb` |
+| `install` / `run` | project-root `gradlew` / `gradlew.bat`, `adb` |
 | `pidcat` | [`pidcat`](https://github.com/JakeWharton/pidcat) |
 | `logcat` | `adb` |
 | `tlog` | [`tlog`](https://github.com/ryans233/tlog) |
-| `preview` | `android` CLI ([Android CLI](https://developer.android.com/tools/android-cli)), `python3`, Pillow, Android Studio (Quail 1 or newer) |
+| `preview` | `android` CLI ([Android CLI](https://developer.android.com/tools/android-cli)), Python 3, Pillow, Android Studio (Quail 1 or newer) |
 
 Run every command from the Android project root: the script reads `app/build.gradle[.kts]` and invokes `./gradlew`.
+
+## Windows
+
+The implementation is a single bash script; there is no PowerShell port. On Windows it runs under **Git Bash** (MSYS2), and a `zed-android-task.cmd` shim makes it callable from PowerShell, cmd.exe and Zed tasks.
+
+```powershell
+git clone git@github.com:ryans233/zed-android-task.git C:\src\zed-android-task
+# Add the repo directory to PATH, then call the shim from any shell:
+C:\src\zed-android-task\zed-android-task.cmd run qaDebug
+```
+
+- `zed-android-task.cmd` locates `bash.exe` (Program Files / LocalAppData / `where bash`, skipping the WSL launcher) and forwards all arguments and the exit code. Override discovery with `ZED_ANDROID_TASK_BASH`.
+- Zed on Windows runs tasks through PowerShell, so `"command": "zed-android-task run qaDebug"` works once the shim's directory is on `PATH`.
+- In Git Bash itself, `ln -s` needs Developer Mode or admin rights. Either symlink as on macOS/Linux, or simply use the `.cmd` and/or add the repo directory to `PATH`.
+- Platform differences handled by the script: `gradlew.bat` is preferred over the POSIX `gradlew`, Gradle is invoked with `bash ./gradlew` when the executable bit is missing, Python is probed as `python3` → `python` → `py -3`, virtualenvs are resolved through `Scripts/python.exe`, and CRLF files/`adb` output are normalized (`tr -d '\r'`).
+- `pidcat` needs Ruby (RubyInstaller) on Windows; `logcat` and `tlog` need no extra runtime. `preview` also needs the `android` CLI to be available for Windows — the script reports a clear error if it is missing.
 
 ## Commands
 
@@ -155,4 +171,5 @@ Notes:
 - `run <variant>` builds, installs and launches in one go — pair it with `hide: "on_success"`;
 - passing an explicit package to `pidcat`/`logcat`/`tlog` skips detection and keeps working when auto-detection cannot resolve a package;
 - log tasks should use `use_new_terminal: true` so they do not occupy the build terminal;
-- `install`/`run`/`pidcat`/`logcat`/`tlog` replace their process via `exec`; nothing after `install` in the same task will run — use `run` when you want install-then-launch.
+- `install`/`run`/`pidcat`/`logcat`/`tlog` replace their process via `exec`; nothing after `install` in the same task will run — use `run` when you want install-then-launch;
+- on Windows, put the repo directory containing `zed-android-task.cmd` on `PATH`; the same `tasks.json` then works unchanged (Zed runs tasks through PowerShell there).

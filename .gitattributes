@@ -1,0 +1,8 @@
+* text=auto
+
+# The bash script must stay LF even on clones with core.autocrlf=true.
+zed-android-task text eol=lf
+*.md text eol=lf
+
+# Batch files must be CRLF for cmd.exe.
+*.cmd text eol=crlf
