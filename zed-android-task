@@ -1,0 +1,750 @@
+#!/bin/bash
+# zed-android-task: reusable Android tasks for Zed editor
+#
+# Auto-detects applicationId and build variants so the same tasks.json
+# entries work in any Android project -- no per-project config needed.
+#
+# Usage:
+#   zed-android-task {install|run} [variant]
+#   zed-android-task {pidcat|logcat|tlog} [package]
+#   zed-android-task preview <file.kt> [options]
+#
+# install/run: variant defaults to "debug". For multi-flavor projects,
+#   pass the full variant name, e.g. "apiDevDebug", "productionRelease".
+#
+# pidcat/logcat/tlog: package auto-detected when omitted; pass a literal
+#   package name to override (e.g. "com.example.app").
+#
+# preview: render every @Preview composable declared in a Kotlin file with
+#   `android studio render-compose-preview`, tile the resulting images into
+#   one PNG, and open it in Zed. Requires Android Studio (Quail 1 or newer)
+#   running with the project open. See `zed-android-task preview --help`.
+
+set -euo pipefail
+
+# --- Helpers ---
+
+# Extract a value assigned to key, handling Kotlin DSL and Groovy DSL.
+# Usage: extract_val <file> <key>
+extract_val() {
+    local f="$1" key="$2"
+    # Handles: key = "val", key "val", key="val", key='val'
+    sed -n 's/^[[:space:]]*'"$key"'[[:space:]=]*"\([^"]*\)".*/\1/p' "$f" | head -1
+}
+
+extract_val_single_quote() {
+    local f="$1" key="$2"
+    sed -n "s/^[[:space:]]*${key}[[:space:]=]*'\([^']*\)'.*/\1/p" "$f" | head -1
+}
+
+# Extract applicationIdSuffix from a named block inside productFlavors or buildTypes.
+# Automatically handles Kotlin DSL (create("name")/named("name")) and Groovy DSL (name).
+# Usage: extract_suffix <file> <outer_block> <plain_name>
+#   outer_block: "productFlavors" or "buildTypes"
+#   plain_name: the raw name without quotes or parens, e.g. "qa", "debug"
+extract_suffix() {
+    local f="$1" outer_block="$2" plain_name="$3"
+    awk -v outer="$outer_block" -v name="$plain_name" '
+    function take_suffix(line,    val) {
+        if (match(line, /applicationIdSuffix[[:space:]=]*"[^"]+"/)) {
+            val = substr(line, RSTART, RLENGTH)
+            sub(/applicationIdSuffix[[:space:]=]*"/, "", val)
+            sub(/"$/, "", val)
+            return val
+        }
+        return ""
+    }
+    # Detect whether a line opens a block for the given plain name.
+    function block_match(line, name) {
+        # Kotlin DSL flavor: create("name") {
+        if (line ~ "create\\(\""name"\"\\)") return 1
+        # Kotlin DSL build type: named("name") {
+        if (line ~ "named\\(\""name"\"\\)") return 1
+        # Groovy DSL: name {
+        if (line ~ "^[[:space:]]*"name"[[:space:]]*{") return 1
+        return 0
+    }
+    # Enter the outer block (productFlavors or buildTypes)
+    $0 ~ "^[[:space:]]*"outer && $0 ~ /{/ { outer_depth = 1; next }
+    outer_depth > 0 {
+        if (/{/) outer_depth++
+        if (/}/) outer_depth--
+        if (outer_depth == 0) exit
+        # Try entering the inner block
+        if (inner_depth == 0 && block_match($0, name)) {
+            inner_depth = 1
+            result = take_suffix($0)   # suffix on the same line as block open?
+            if (result != "") exit
+            next
+        }
+        # Inside the inner block: track depth, extract suffix
+        if (inner_depth > 0) {
+            if (/{/) inner_depth++
+            if (/}/) inner_depth--
+            if (inner_depth == 0) next
+            result = take_suffix($0)
+            if (result != "") exit
+        }
+    }
+    END { if (result != "") print result }' "$f" 2>/dev/null
+}
+
+# --- Variant parsing ---
+
+# Parse variant string into flavor and build type.
+# Convention: variant ends with "debug" or "release" (case-insensitive).
+# Everything before is the flavor name (empty for single-buildType projects).
+# Sets: VARIANT_FLAVOR, VARIANT_BUILD_TYPE, VARIANT_TASK_CAP
+parse_variant() {
+    local variant="${1:-debug}"
+
+    # Normalize to lowercase for comparison (macOS bash 3.2 compat)
+    local lower
+    lower=$(printf '%s' "$variant" | tr '[:upper:]' '[:lower:]')
+
+    if [[ "$lower" == *debug ]]; then
+        VARIANT_BUILD_TYPE="debug"
+        # Strip trailing "debug" (case-insensitively) by length
+        VARIANT_FLAVOR="${variant:0:${#variant}-5}"
+    elif [[ "$lower" == *release ]]; then
+        VARIANT_BUILD_TYPE="release"
+        VARIANT_FLAVOR="${variant:0:${#variant}-7}"
+    else
+        # Try splitting character by character
+        local rest="$variant"
+        VARIANT_FLAVOR=""
+        VARIANT_BUILD_TYPE=""
+        # Accumulate prefix until the remaining suffix is a known build type
+        local acc=""
+        local rlower
+        for (( i = 0; i < ${#variant}; i++ )); do
+            # Build up remainder from the tail: check if variant[i:] is debug/release
+            local tail="${variant:$i}"
+            local tlower
+            tlower=$(printf '%s' "$tail" | tr '[:upper:]' '[:lower:]')
+            if [[ "$tlower" == "debug" || "$tlower" == "release" ]]; then
+                VARIANT_FLAVOR="${variant:0:$i}"
+                VARIANT_BUILD_TYPE="$tlower"
+                break
+            fi
+        done
+        if [[ -z "$VARIANT_BUILD_TYPE" ]]; then
+            echo "Error: cannot parse variant '$variant' (expected e.g. 'debug', 'apiDevDebug')" >&2
+            return 1
+        fi
+    fi
+
+    # Build capitalized gradle task name: "ApiDev" + "Debug"
+    if [[ -n "$VARIANT_FLAVOR" ]]; then
+        local flavor_cap bt_cap
+        flavor_cap="$(printf '%s' "${VARIANT_FLAVOR:0:1}" | tr '[:lower:]' '[:upper:]')${VARIANT_FLAVOR:1}"
+        bt_cap="$(printf '%s' "${VARIANT_BUILD_TYPE:0:1}" | tr '[:lower:]' '[:upper:]')${VARIANT_BUILD_TYPE:1}"
+        VARIANT_TASK_CAP="${flavor_cap}${bt_cap}"
+    else
+        local bt_cap
+        bt_cap="$(printf '%s' "${VARIANT_BUILD_TYPE:0:1}" | tr '[:lower:]' '[:upper:]')${VARIANT_BUILD_TYPE:1}"
+        VARIANT_TASK_CAP="${bt_cap}"
+    fi
+}
+
+
+# --- Package detection ---
+
+# Detect the base applicationId from gradle files (defaultConfig block).
+detect_base_package() {
+    local gradle_files=("app/build.gradle.kts" "app/build.gradle")
+    local manifest="app/src/main/AndroidManifest.xml"
+    local pkg=""
+
+    for f in "${gradle_files[@]}"; do
+        if [[ -f "$f" ]]; then
+            pkg=$(extract_val "$f" "applicationId")
+            [[ -z "$pkg" ]] && pkg=$(extract_val_single_quote "$f" "applicationId")
+            if [[ -n "$pkg" ]]; then
+                echo "$pkg"
+                return 0
+            fi
+        fi
+    done
+
+    # Fallback: legacy projects without applicationId in build.gradle
+    if [[ -f "$manifest" ]]; then
+        pkg=$(sed -n 's/.*package="\([^"]*\)".*/\1/p' "$manifest" | head -1)
+        if [[ -n "$pkg" ]]; then
+            echo "$pkg"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# Compute the final package name for a given variant.
+# Uses base applicationId + applicationIdSuffix from flavor + build type.
+compute_variant_package() {
+    local gradle_file
+    if [[ -f "app/build.gradle.kts" ]]; then
+        gradle_file="app/build.gradle.kts"
+    elif [[ -f "app/build.gradle" ]]; then
+        gradle_file="app/build.gradle"
+    else
+        echo ""  # fallback: return empty
+        return
+    fi
+
+    local base_pkg
+    base_pkg=$(detect_base_package) || true
+    if [[ -z "$base_pkg" ]]; then
+        echo ""
+        return
+    fi
+
+    local suffix=""
+
+    # Product flavor suffix (if flavor is set)
+    if [[ -n "$VARIANT_FLAVOR" ]]; then
+        local flavor_suffix
+        flavor_suffix=$(extract_suffix "$gradle_file" "productFlavors" "$VARIANT_FLAVOR")
+        suffix="${suffix}${flavor_suffix}"
+    fi
+
+    # Build type suffix
+    local bt_suffix
+    bt_suffix=$(extract_suffix "$gradle_file" "buildTypes" "$VARIANT_BUILD_TYPE")
+    suffix="${suffix}${bt_suffix}"
+
+    echo "${base_pkg}${suffix}"
+}
+
+
+# --- Compose preview rendering ---
+
+preview_usage() {
+    cat >&2 <<'EOF'
+Usage: zed-android-task preview <file.kt> [options]
+
+Renders every @Preview composable declared in <file.kt> using
+`android studio render-compose-preview`, tiles the resulting images into a
+single PNG, and opens it in Zed.
+
+Options:
+  --project <name|path>  Android Studio project to query (see
+                         `android studio check`). Only needed when more than
+                         one project is open.
+  --out <path>           Where to write the combined image
+                         (default: ~/.cache/zed-android-task/<file>-previews.png).
+  --columns <n>          Grid columns (default: ceil(sqrt(preview count))).
+  --no-open              Do not open the combined image in Zed.
+  -h, --help             Show this help.
+
+Requires Android Studio (Quail 1 or newer) running with this project open.
+EOF
+}
+
+# Print the names of @Preview composables declared in a Kotlin file, one per
+# line. Handles fully-qualified annotations, multi-preview meta-annotations
+# (e.g. @PreviewLightDark / @MyScreenPreview), annotations that span several
+# lines, and comments/strings that would otherwise produce false positives.
+discover_previews() {
+    python3 - "$1" <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        raw = fh.read()
+except OSError as exc:
+    print("cannot read %s: %s" % (path, exc), file=sys.stderr)
+    sys.exit(1)
+
+
+def strip_comments(text):
+    """Blank out // and /* */ comments and string literals, keeping offsets."""
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        two = text[i:i + 2]
+        if two == "//":
+            j = text.find("\n", i)
+            if j == -1:
+                break
+            out.append(" " * (j - i))
+            i = j
+        elif two == "/*":
+            j = text.find("*/", i + 2)
+            j = n if j == -1 else j + 2
+            out.append("".join(ch if ch == "\n" else " " for ch in text[i:j]))
+            i = j
+        elif text[i] == '"':
+            if text[i:i + 3] == '"""':
+                j = text.find('"""', i + 3)
+                j = n if j == -1 else j + 3
+            else:
+                j = i + 1
+                while j < n:
+                    if text[j] == "\\":
+                        j += 2
+                        continue
+                    if text[j] == '"':
+                        j += 1
+                        break
+                    j += 1
+            out.append("".join(ch if ch == "\n" else " " for ch in text[i:j]))
+            i = j
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+ANNO = re.compile(r"@([A-Za-z_][\w.]*)")
+FUN = re.compile(r"\bfun\s+(?:<[^>{}()]*>\s*)?`?([A-Za-z_]\w*)`?\s*\(")
+MODIFIERS = re.compile(
+    r"^(?:(?:public|private|protected|internal|open|final|abstract|override|"
+    r"suspend|inline|infix|operator|external|expect|actual|tailrec)\s*)+$"
+)
+
+
+def is_preview(name):
+    if name.startswith("PreviewParameter"):
+        return False
+    return name == "Preview" or name.startswith("Preview") or name.endswith("Preview")
+
+
+lines = strip_comments(raw).splitlines()
+names, seen, pending = [], set(), False
+i = 0
+while i < len(lines):
+    line = lines[i].strip()
+    if not line:
+        i += 1
+        continue
+    if line.startswith("@"):
+        block = line
+        depth = line.count("(") - line.count(")")
+        while depth > 0 and i + 1 < len(lines):
+            i += 1
+            block += " " + lines[i]
+            depth += lines[i].count("(") - lines[i].count(")")
+        for match in ANNO.finditer(block):
+            if is_preview(match.group(1).split(".")[-1]):
+                pending = True
+        fun = FUN.search(block)
+        if fun:
+            if pending and fun.group(1) not in seen:
+                seen.add(fun.group(1))
+                names.append(fun.group(1))
+            pending = False
+        i += 1
+        continue
+    fun = FUN.search(line)
+    if fun:
+        if pending and fun.group(1) not in seen:
+            seen.add(fun.group(1))
+            names.append(fun.group(1))
+        pending = False
+        i += 1
+        continue
+    if MODIFIERS.match(line):
+        i += 1
+        continue
+    pending = False
+    i += 1
+
+print("\n".join(names))
+PY
+}
+
+# Echo the path to a python interpreter that can `import PIL`. Installs
+# Pillow into a cached virtualenv on first use so the caller never has to.
+preview_python_with_pillow() {
+    if python3 -c 'import PIL' >/dev/null 2>&1; then
+        printf '%s\n' "python3"
+        return 0
+    fi
+
+    local venv="${XDG_CACHE_HOME:-$HOME/.cache}/zed-android-task/venv"
+    if [[ -x "$venv/bin/python" ]] && "$venv/bin/python" -c 'import PIL' >/dev/null 2>&1; then
+        printf '%s\n' "$venv/bin/python"
+        return 0
+    fi
+
+    echo "zed-android-task: installing Pillow into $venv ..." >&2
+    python3 -m venv "$venv" >/dev/null 2>&1 || return 1
+    "$venv/bin/python" -m pip install --quiet --disable-pip-version-check pillow >/dev/null 2>&1 || return 1
+    if "$venv/bin/python" -c 'import PIL' >/dev/null 2>&1; then
+        printf '%s\n' "$venv/bin/python"
+        return 0
+    fi
+    return 1
+}
+
+do_preview() {
+    local file="" project="" out="" columns=""
+    local open=1
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                preview_usage
+                return 0
+                ;;
+            --project)
+                project="${2:-}"
+                shift 2
+                ;;
+            --project=*)
+                project="${1#*=}"
+                shift
+                ;;
+            --out)
+                out="${2:-}"
+                shift 2
+                ;;
+            --out=*)
+                out="${1#*=}"
+                shift
+                ;;
+            --columns)
+                columns="${2:-}"
+                shift 2
+                ;;
+            --columns=*)
+                columns="${1#*=}"
+                shift
+                ;;
+            --no-open)
+                open=0
+                shift
+                ;;
+            --open)
+                open=1
+                shift
+                ;;
+            -*)
+                echo "zed-android-task preview: unknown option '$1'" >&2
+                preview_usage
+                return 1
+                ;;
+            *)
+                if [[ -z "$file" ]]; then
+                    file="$1"
+                else
+                    echo "zed-android-task preview: unexpected argument '$1'" >&2
+                    return 1
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$file" ]]; then
+        echo "zed-android-task preview: missing <file.kt>" >&2
+        preview_usage
+        return 1
+    fi
+    if [[ ! -f "$file" ]]; then
+        echo "zed-android-task preview: no such file: $file" >&2
+        return 1
+    fi
+
+    command -v android >/dev/null 2>&1 || {
+        echo "zed-android-task preview: 'android' CLI not found on PATH." >&2
+        echo "  Install it: https://developer.android.com/tools/android-cli" >&2
+        return 1
+    }
+    command -v python3 >/dev/null 2>&1 || {
+        echo "zed-android-task preview: python3 not found on PATH." >&2
+        return 1
+    }
+
+    # Make the path absolute so it is unambiguous to Android Studio regardless
+    # of the task's working directory.
+    local dir base
+    dir="$(cd "$(dirname "$file")" && pwd)"
+    base="$(basename "$file")"
+    file="$dir/$base"
+
+    local check_out
+    check_out="$(android studio check 2>&1 || true)"
+    if printf '%s' "$check_out" | grep -qi "no running studio"; then
+        echo "zed-android-task preview: no running Android Studio instance found." >&2
+        echo "  render-compose-preview needs Android Studio (Quail 1 or newer)" >&2
+        echo "  running with this project open." >&2
+        return 1
+    fi
+
+    local names
+    if ! names="$(discover_previews "$file")"; then
+        echo "zed-android-task preview: failed to scan $base for previews." >&2
+        return 1
+    fi
+    if [[ -z "$names" ]]; then
+        echo "zed-android-task preview: no @Preview composables found in $base" >&2
+        return 1
+    fi
+
+    local py
+    if ! py="$(preview_python_with_pillow)"; then
+        echo "zed-android-task preview: could not obtain a Python with Pillow." >&2
+        echo "  Install it manually, e.g. 'python3 -m pip install pillow'." >&2
+        return 1
+    fi
+
+    local count=0 nm
+    echo "Compose previews in $base:"
+    while IFS= read -r nm; do
+        [[ -n "$nm" ]] || continue
+        count=$((count + 1))
+        printf '  %2d. %s\n' "$count" "$nm"
+    done <<< "$names"
+    echo
+
+    local tmp
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/zed-compose-preview.XXXXXX")"
+
+    local rendered=()
+    while IFS= read -r nm; do
+        [[ -n "$nm" ]] || continue
+        local safe img log rc=0
+        safe="$(printf '%s' "$nm" | tr -c 'A-Za-z0-9._-' '_')"
+        img="$tmp/$safe.png"
+        log="$tmp/$safe.log"
+
+        printf 'Rendering %-40s ... ' "$nm"
+        if [[ -n "$project" ]]; then
+            android studio render-compose-preview "$file" "$nm" \
+                --output-image-file "$img" --project "$project" >"$log" 2>&1 || rc=1
+        else
+            android studio render-compose-preview "$file" "$nm" \
+                --output-image-file "$img" >"$log" 2>&1 || rc=1
+        fi
+
+        if [[ "$rc" -eq 0 && -f "$img" ]]; then
+            echo "ok"
+            rendered+=("$img")
+        else
+            echo "failed"
+            sed 's/^/    /' "$log" >&2 || true
+        fi
+    done <<< "$names"
+
+    if [[ "${#rendered[@]}" -eq 0 ]]; then
+        echo "zed-android-task preview: no previews rendered successfully." >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    if [[ -z "$out" ]]; then
+        local cache="${XDG_CACHE_HOME:-$HOME/.cache}/zed-android-task"
+        mkdir -p "$cache"
+        out="$cache/${base%.*}-previews.png"
+    fi
+    mkdir -p "$(dirname "$out")"
+
+    echo
+    "$py" - "$out" "${columns:-0}" "$base" "${rendered[@]}" <<'PY'
+import math
+import os
+import sys
+
+from PIL import Image, ImageDraw, ImageFont
+
+
+def load_font(size):
+    for candidate in (
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/Library/Fonts/Arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ):
+        try:
+            return ImageFont.truetype(candidate, size)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default(size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def main():
+    out_path = sys.argv[1]
+    try:
+        cols = int(sys.argv[2])
+    except (ValueError, IndexError):
+        cols = 0
+    title = sys.argv[3] if len(sys.argv) > 3 else ""
+    files = sys.argv[4:]
+
+    items = []
+    for path in files:
+        try:
+            image = Image.open(path).convert("RGBA")
+        except Exception as exc:  # noqa: BLE001 - report and skip bad image
+            print("warning: skipped %s (%s)" % (path, exc), file=sys.stderr)
+            continue
+        items.append((os.path.splitext(os.path.basename(path))[0], image))
+
+    if not items:
+        print("error: nothing to combine", file=sys.stderr)
+        return 2
+
+    n = len(items)
+    if cols <= 0:
+        cols = max(1, math.ceil(math.sqrt(n)))
+    cols = min(cols, n)
+    rows = math.ceil(n / cols)
+
+    pad = 16
+    label_h = 28
+    title_h = 48 if title else 0
+    title_font = load_font(20)
+    label_font = load_font(15)
+
+    cell_w = max(image.width for _, image in items)
+    cell_h = max(image.height for _, image in items)
+    width = pad + cols * (cell_w + pad)
+    height = title_h + pad + rows * (cell_h + label_h + pad)
+
+    canvas = Image.new("RGBA", (width, height), (255, 255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+
+    if title:
+        draw.text((pad, 14), title, fill=(17, 17, 17, 255), font=title_font)
+
+    for index, (name, image) in enumerate(items):
+        row, col = divmod(index, cols)
+        cell_x = pad + col * (cell_w + pad)
+        cell_y = title_h + pad + row * (cell_h + label_h + pad)
+
+        draw.rectangle(
+            [cell_x - 1, cell_y - 1, cell_x + cell_w, cell_y + cell_h],
+            outline=(222, 222, 222, 255),
+        )
+
+        image_x = cell_x + (cell_w - image.width) // 2
+        image_y = cell_y + (cell_h - image.height) // 2
+        canvas.alpha_composite(image, (image_x, image_y))
+
+        try:
+            text_w = draw.textlength(name, font=label_font)
+        except AttributeError:
+            text_w = label_font.getsize(name)[0]
+        label_x = cell_x + max(0, (cell_w - text_w) // 2)
+        draw.text(
+            (label_x, cell_y + cell_h + 6),
+            name,
+            fill=(68, 68, 68, 255),
+            font=label_font,
+        )
+
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+    canvas.convert("RGB").save(out_path)
+    print("Combined %d preview(s) -> %s (%dx%d)" % (n, out_path, width, height))
+    return 0
+
+
+sys.exit(main())
+PY
+
+    rm -rf "$tmp"
+
+    if [[ "$open" -eq 1 ]] && command -v zed >/dev/null 2>&1; then
+        zed "$out" >/dev/null 2>&1 || true
+    else
+        echo "Combined image: $out"
+    fi
+}
+
+
+# --- Main ---
+
+main() {
+    local cmd="${1:-}"
+    local arg="${2:-}"
+
+    if [[ -z "$cmd" ]]; then
+        echo "Usage: zed-android-task {install|run} [variant]" >&2
+        echo "       zed-android-task {pidcat|logcat|tlog} [package]" >&2
+        echo "       zed-android-task preview <file.kt> [options]" >&2
+    fi
+
+    case "$cmd" in
+        install|run)
+            # These use variant-based gradle task naming
+            local variant="${arg:-debug}"
+            parse_variant "$variant"
+
+            if [[ "$cmd" == "install" ]]; then
+                exec ./gradlew "assemble${VARIANT_TASK_CAP}" "install${VARIANT_TASK_CAP}"
+            else
+                ./gradlew "assemble${VARIANT_TASK_CAP}" "install${VARIANT_TASK_CAP}"
+                local pkg
+                pkg=$(compute_variant_package)
+                if [[ -z "$pkg" ]]; then
+                    echo "Error: could not determine package name for variant '$variant'" >&2
+                    exit 1
+                fi
+                exec adb shell monkey -p "$pkg" -c android.intent.category.LAUNCHER 1
+            fi
+            ;;
+        pidcat)
+            if [[ -n "$arg" ]]; then
+                exec pidcat "$arg"
+            else
+                parse_variant "debug"
+                local pkg
+                pkg=$(compute_variant_package)
+                if [[ -z "$pkg" ]]; then
+                    echo "Error: could not auto-detect package name. Specify it: zed-android-task pidcat com.example.app" >&2
+                    exit 1
+                fi
+                exec pidcat "$pkg"
+            fi
+            ;;
+        logcat)
+            if [[ -n "$arg" ]]; then
+                exec adb logcat -v color --pid="$(adb shell pidof -s "$arg")" '*:V'
+            else
+                parse_variant "debug"
+                local pkg
+                pkg=$(compute_variant_package)
+                if [[ -z "$pkg" ]]; then
+                    echo "Error: could not auto-detect package name. Specify it: zed-android-task logcat com.example.app" >&2
+                    exit 1
+                fi
+                exec adb logcat -v color --pid="$(adb shell pidof -s "$pkg")" '*:V'
+            fi
+            ;;
+        tlog)
+            if [[ -n "$arg" ]]; then
+                exec tlog --filter "package:$arg"
+            else
+                parse_variant "debug"
+                local pkg
+                pkg=$(compute_variant_package)
+                if [[ -z "$pkg" ]]; then
+                    echo "Error: could not auto-detect package name. Specify it: zed-android-task tlog com.example.app" >&2
+                    exit 1
+                fi
+                exec tlog --filter "package:$pkg"
+            fi
+            ;;
+        preview)
+            shift || true
+            do_preview "$@"
+            ;;
+        *)
+            echo "Usage: zed-android-task {install|run} [variant]" >&2
+            echo "       zed-android-task {pidcat|logcat|tlog} [package]" >&2
+            echo "       zed-android-task preview <file.kt> [options]" >&2
+            exit 1
+            ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
